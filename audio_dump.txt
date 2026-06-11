@@ -1,0 +1,1 @@
+﻿		AudioDeviceAttributes: role:output type:speaker addr:null name: profiles:[] descriptors:[]

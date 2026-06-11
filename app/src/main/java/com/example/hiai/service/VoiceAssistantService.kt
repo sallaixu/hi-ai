@@ -15,14 +15,22 @@ import androidx.core.app.NotificationCompat
 import com.example.hiai.MainActivity
 import com.example.hiai.R
 import com.example.hiai.audio.AudioProcessor
+import com.example.hiai.audio.AudioPlayer
 import com.example.hiai.audio.OpusCodec
+import com.example.hiai.audio.OpusCodecInterface
 import com.example.hiai.audio.WakeWordDetector
 import com.example.hiai.data.AppDatabase
+import com.example.hiai.data.DatabaseInitializer
 import com.example.hiai.data.repository.ChatHistoryRepository
 import com.example.hiai.data.repository.SettingRepository
 import com.example.hiai.network.NetworkManager
+import com.example.hiai.network.model.HelloRequest
 import com.example.hiai.network.model.HelloResponse
+import com.example.hiai.network.model.ListenRequest
+import com.example.hiai.network.model.McpToolRequest
+import com.example.hiai.network.model.McpToolResponse
 import com.example.hiai.network.model.SttMessage
+import com.example.hiai.network.model.TtsAudioData
 import com.example.hiai.network.model.TtsMessage
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -55,10 +63,11 @@ class VoiceAssistantService : Service() {
     val isDeskMode: StateFlow<Boolean> = _isDeskMode.asStateFlow()
     
     // 组件
-    private lateinit var networkManager: NetworkManager
+    private var networkManager: NetworkManager? = null
     private lateinit var audioProcessor: AudioProcessor
     private lateinit var opusCodec: OpusCodecInterface
-    private lateinit var settingRepository: SettingRepository
+    private lateinit var audioPlayer: AudioPlayer
+    internal lateinit var settingRepository: SettingRepository
     private lateinit var chatHistoryRepository: ChatHistoryRepository
     
     // 唤醒词检测器
@@ -66,6 +75,12 @@ class VoiceAssistantService : Service() {
     
     // 协程
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    // 网络管理器初始化状态
+    private var isNetworkManagerInitialized = false
+    
+    // Hello 响应是否已收到（表示音频参数已确定）
+    private var isHelloReceived = false
     
     // Binder
     private val binder = LocalBinder()
@@ -78,23 +93,14 @@ class VoiceAssistantService : Service() {
         super.onCreate()
         
         // 初始化数据库
-        val database = AppDatabase.getDatabase(this)
+        val database = DatabaseInitializer.getDatabase(this)
         settingRepository = SettingRepository(database.settingDao())
         chatHistoryRepository = ChatHistoryRepository(database.chatHistoryDao())
         
-        // 初始化网络管理器
-        val baseUrl = settingRepository.get("server_url") ?: "http://localhost:8000"
-        val deviceId = settingRepository.get("device_id") ?: getDeviceId()
-        networkManager = NetworkManager(
-            baseUrl = baseUrl,
-            deviceId = deviceId,
-            deviceName = "Android Assistant",
-            token = settingRepository.get("token") ?: ""
-        )
-        
-        // 初始化音频组件
-        opusCodec = OpusCodec()
-        audioProcessor = AudioProcessor()
+        // 初始化音频组件（使用默认采样率 16000Hz，Hello 响应后可能重新初始化）
+        opusCodec = OpusCodec(sampleRate = 16000)
+        audioProcessor = AudioProcessor(sampleRate = 16000)
+        audioPlayer = AudioPlayer(this, opusCodec as OpusCodec, 16000, serviceScope)
         
         // 初始化唤醒词检测器
         wakeWordDetector = WakeWordDetector(this) { keyword ->
@@ -104,6 +110,38 @@ class VoiceAssistantService : Service() {
         
         // 创建通知渠道
         createNotificationChannel()
+        
+        // 在协程中初始化网络管理器（需要读取设置）
+        serviceScope.launch {
+            initializeNetworkManager()
+        }
+    }
+    
+    /**
+     * 初始化网络管理器
+     */
+    private suspend fun initializeNetworkManager() {
+        Log.d(TAG, "=== initializeNetworkManager: START ===")
+        try {
+            val baseUrl = settingRepository.get("server_url") ?: "http://localhost:8000"
+            val deviceId = settingRepository.get("device_id") ?: getDeviceIdString()
+            val token = settingRepository.get("token") ?: ""
+            
+            Log.d(TAG, "  - server_url: $baseUrl")
+            Log.d(TAG, "  - device_id: $deviceId")
+            Log.d(TAG, "  - token: ${if (token.isEmpty()) "(empty)" else "***"}")
+            
+            networkManager = NetworkManager(
+                baseUrl = baseUrl,
+                deviceId = deviceId,
+                deviceName = "Android Assistant",
+                token = token
+            )
+            isNetworkManagerInitialized = true
+            Log.d(TAG, "=== initializeNetworkManager: SUCCESS ===")
+        } catch (e: Exception) {
+            Log.e(TAG, "=== initializeNetworkManager: FAILED ===", e)
+        }
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -127,20 +165,35 @@ class VoiceAssistantService : Service() {
         wakeWordDetector?.release()
         wakeWordDetector = null
         
+        audioPlayer.release()
         audioProcessor.release()
         opusCodec.release()
-        networkManager.disconnect()
+        networkManager?.disconnect()
     }
     
     /**
      * 启动前台服务
      */
     private fun startForegroundService() {
-        val notification = createNotification()
-        startForeground(NOTIFICATION_ID, notification)
+        Log.d(TAG, "=== startForegroundService: START ===")
+        try {
+            val notification = createNotification()
+            startForeground(NOTIFICATION_ID, notification)
+            Log.d(TAG, "  - Notification created and service started")
         
-        // 连接服务端
-        connectToServer()
+            // 等待网络管理器初始化完成后连接服务端
+            serviceScope.launch {
+                Log.d(TAG, "  - Waiting for network manager initialization...")
+                // 等待网络管理器初始化
+                while (!isNetworkManagerInitialized) {
+                    kotlinx.coroutines.delay(100)
+                }
+                Log.d(TAG, "  - Network manager initialized, connecting to server...")
+                connectToServer()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "=== startForegroundService: FAILED ===", e)
+        }
     }
     
     /**
@@ -185,23 +238,64 @@ class VoiceAssistantService : Service() {
      * 连接服务端
      */
     private fun connectToServer() {
+        Log.d(TAG, "=== connectToServer: START ===")
         serviceScope.launch {
-            // 获取 OTA 信息
-            val otaResponse = networkManager.fetchOtaInfo()
-            if (otaResponse != null) {
-                // 连接 WebSocket
-                networkManager.connect(otaResponse.websocket.url, otaResponse.websocket.token)
-                
-                // 监听消息
-                networkManager.messageFlow.collect { message ->
-                    when (message) {
-                        is HelloResponse -> handleHelloResponse(message)
-                        is SttMessage -> handleSttMessage(message)
-                        is TtsMessage -> handleTtsMessage(message)
-                        // 其他消息类型...
+            try {
+                // 先开始监听消息（在连接之前），避免丢失 Hello 响应
+                Log.d(TAG, "  - Starting message flow listener...")
+                val messageJob = launch {
+                    networkManager?.messageFlow?.collect { message ->
+                        Log.d(TAG, "    - Received message: ${message::class.java.simpleName}, type: ${message::class.java.name}")
+                        when (message) {
+                            is HelloResponse -> {
+                                Log.d(TAG, "      -> Handling HelloResponse")
+                                handleHelloResponse(message)
+                            }
+                            is SttMessage -> {
+                                Log.d(TAG, "      -> Handling SttMessage")
+                                handleSttMessage(message)
+                            }
+                            is TtsMessage -> {
+                                Log.d(TAG, "      -> Handling TtsMessage")
+                                handleTtsMessage(message)
+                            }
+                            is TtsAudioData -> {
+                                Log.d(TAG, "      -> Handling TtsAudioData")
+                                handleTtsAudioData(message)
+                            }
+                            else -> {
+                                Log.w(TAG, "      -> Ignoring unknown message type: ${message::class.java.name}")
+                            }
+                        }
                     }
                 }
-            } else {
+                
+                // 获取 OTA 信息
+                Log.d(TAG, "  - Fetching OTA info...")
+                val otaResponse = networkManager?.fetchOtaInfo()
+                Log.d(TAG, "  - OTA response: ${otaResponse != null}")
+                
+                if (otaResponse != null && networkManager != null) {
+                    // 检查设备是否需要激活（仅记录日志，不影响连接）
+                    if (otaResponse.activation != null) {
+                        Log.d(TAG, "  - Device requires activation!")
+                        Log.d(TAG, "  - Activation code: ${otaResponse.activation.code}")
+                        Log.d(TAG, "  - Activation message: ${otaResponse.activation.message}")
+                        Log.d(TAG, "  - Will connect WebSocket to receive activation audio...")
+                    }
+                    
+                    Log.d(TAG, "  - WebSocket URL: ${otaResponse.websocket.url}")
+                    Log.d(TAG, "  - Connecting to WebSocket...")
+                    // 连接 WebSocket（即使设备需要激活也要连接，因为服务端会通过 WebSocket 发送激活码播报）
+                    networkManager?.connect(otaResponse.websocket.url, otaResponse.websocket.token)
+                    Log.d(TAG, "  - WebSocket connect called")
+                } else {
+                    Log.e(TAG, "  - OTA response or network manager is null")
+                    _serviceState.value = ServiceState.Error
+                    messageJob.cancel()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "=== connectToServer: FAILED ===", e)
                 _serviceState.value = ServiceState.Error
             }
         }
@@ -216,8 +310,35 @@ class VoiceAssistantService : Service() {
             settingRepository.set("session_id", response.sessionId)
         }
         
+        // 根据服务端配置动态初始化音频组件（如果采样率不同）
+        val serverSampleRate = response.audioParams?.sampleRate ?: 16000
+        val currentSampleRate = (opusCodec as? OpusCodec)?.sampleRate ?: 16000
+        
+        Log.d(TAG, "Hello response: sample_rate=$serverSampleRate, format=${response.audioParams?.format}")
+        
+        if (serverSampleRate != currentSampleRate) {
+            Log.d(TAG, "Sample rate changed: $currentSampleRate -> $serverSampleRate, reinitializing audio components")
+            
+            // 释放旧的音频组件
+            audioPlayer?.stopPlaying()
+            audioPlayer?.release()
+            opusCodec?.release()
+            
+            // 创建新的音频组件
+            opusCodec = OpusCodec(sampleRate = serverSampleRate)
+            audioProcessor = AudioProcessor(sampleRate = serverSampleRate)
+            audioPlayer = AudioPlayer(this, opusCodec as OpusCodec, serverSampleRate, serviceScope)
+            Log.d(TAG, "Audio components reinitialized with sample_rate=$serverSampleRate")
+        } else {
+            Log.d(TAG, "Sample rate unchanged ($currentSampleRate), keeping existing audio components")
+        }
+        
+        // 标记 Hello 响应已收到
+        isHelloReceived = true
+        Log.d(TAG, "Hello response processed, isHelloReceived=true")
+        
         // 发送聆听状态（唤醒检测）
-        networkManager.sendListen(state = "detect")
+        networkManager?.sendListen(state = "detect")
         
         _serviceState.value = ServiceState.Idle
     }
@@ -241,29 +362,57 @@ class VoiceAssistantService : Service() {
     private fun handleTtsMessage(message: TtsMessage) {
         when (message.state) {
             "start" -> {
+                Log.d(TAG, "TTS start received, stopping recording")
+                // 停止录音，避免与播放冲突
+                audioProcessor.stopRecording()
                 _serviceState.value = ServiceState.Speaking
             }
             "stop" -> {
+                Log.d(TAG, "TTS stop received, stopping audio player")
+                audioPlayer.stopPlaying()
                 _serviceState.value = ServiceState.Idle
             }
+            else -> {
+                Log.d(TAG, "TTS state: ${message.state}")
+            }
         }
+    }
+    
+    /**
+     * 处理 TTS 音频数据
+     */
+    private fun handleTtsAudioData(data: TtsAudioData) {
+        Log.d(TAG, "handleTtsAudioData: ${data.opusData.size} bytes")
+        // 将 Opus 数据送入播放器
+        audioPlayer.enqueueAudioData(data.opusData)
     }
     
     /**
      * 切换桌面模式
      */
     private fun toggleDeskMode() {
-        val newMode = !_isDeskMode.value
-        _isDeskMode.value = newMode
-        
-        if (newMode) {
-            // 进入桌面模式，启动唤醒词检测
-            wakeWordDetector?.start()
-            Log.i(TAG, "Desktop mode enabled, wake word detection started")
-        } else {
-            // 退出桌面模式，停止唤醒词检测
-            wakeWordDetector?.stop()
-            Log.i(TAG, "Desktop mode disabled, wake word detection stopped")
+        Log.d(TAG, "=== toggleDeskMode: START ===")
+        try {
+            val newMode = !_isDeskMode.value
+            _isDeskMode.value = newMode
+            
+            Log.d(TAG, "  - New mode: $newMode")
+            
+            if (newMode) {
+                // 进入桌面模式，启动唤醒词检测
+                Log.d(TAG, "  - Starting wake word detector...")
+                wakeWordDetector?.start()
+                Log.d(TAG, "  - Wake word detector started")
+                Log.i(TAG, "Desktop mode enabled, wake word detection started")
+            } else {
+                // 退出桌面模式，停止唤醒词检测
+                Log.d(TAG, "  - Stopping wake word detector...")
+                wakeWordDetector?.stop()
+                Log.d(TAG, "  - Wake word detector stopped")
+                Log.i(TAG, "Desktop mode disabled, wake word detection stopped")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "=== toggleDeskMode: FAILED ===", e)
         }
     }
     
@@ -273,14 +422,32 @@ class VoiceAssistantService : Service() {
     private fun onWakeWordDetected(keyword: String) {
         Log.i(TAG, "Wake word detected: $keyword")
         
-        // 发送 listen 消息，开始录音上传
-        networkManager.sendListen(state = "start", text = keyword)
-        
-        // 进入 LISTENING 状态
-        _serviceState.value = ServiceState.Listening
-        
-        // 开始录音并上传音频流
-        startRecordingAndUpload()
+        // 等待 WebSocket 连接和 Hello 响应
+        serviceScope.launch {
+            Log.d(TAG, "Waiting for WebSocket connection and Hello response...")
+            var waitCount = 0
+            while (!isHelloReceived || networkManager?.isConnectionOpen() != true) {
+                if (waitCount % 10 == 0) {  // 每 1 秒打印一次日志
+                    Log.d(TAG, "  - isHelloReceived=$isHelloReceived, isConnected=${networkManager?.isConnectionOpen()}")
+                }
+                kotlinx.coroutines.delay(100)
+                waitCount++
+                if (waitCount > 100) {  // 超时 10 秒
+                    Log.e(TAG, "Timeout waiting for WebSocket connection and Hello response")
+                    return@launch
+                }
+            }
+            Log.d(TAG, "WebSocket connected and Hello received, proceeding with wake word handling")
+            
+            // 发送 listen 消息，开始录音上传
+            networkManager?.sendListen(state = "start", text = keyword)
+            
+            // 进入 LISTENING 状态
+            _serviceState.value = ServiceState.Listening
+            
+            // 开始录音并上传音频流
+            startRecordingAndUpload()
+        }
     }
     
     /**
@@ -288,11 +455,18 @@ class VoiceAssistantService : Service() {
      */
     private fun startRecordingAndUpload() {
         serviceScope.launch {
-            audioProcessor.startRecording().collect { pcmData ->
+            // 获取 OpusCodec 期望的单帧 PCM 缓冲区大小 (pcmBufferSize)
+            val expectedBufferSize = (opusCodec as? OpusCodec)?.pcmBufferSize ?: -1
+            audioProcessor.startRecording(expectedBufferSize).collect { pcmData ->
+                // 确保每次送入编码的数据大小完全符合 frameSize 的要求
+                if (expectedBufferSize > 0 && pcmData.size != expectedBufferSize) {
+                    Log.w(TAG, "Recording buffer size mismatch. Expected: $expectedBufferSize, Got: ${pcmData.size}. Skipping frame to avoid crash.")
+                    return@collect
+                }
                 // 编码为 Opus
                 val opusData = opusCodec.encode(pcmData)
                 // 发送到服务端
-                networkManager.sendAudio(opusData)
+                networkManager?.sendAudio(opusData)
             }
         }
     }
@@ -308,7 +482,7 @@ class VoiceAssistantService : Service() {
     /**
      * 获取设备 ID
      */
-    private fun getDeviceId(): String {
+    private fun getDeviceIdString(): String {
         return Build.SERIAL.ifBlank { "unknown" }
     }
     

@@ -72,7 +72,6 @@ class WakeWordDetector(
             // 创建 KeywordSpotter 配置
             val config = KeywordSpotterConfig(
                 featConfig = com.k2fsa.sherpa.onnx.FeatureConfig(
-                    samplingRate = SAMPLE_RATE,
                     featureDim = 80
                 ),
                 modelConfig = OnlineModelConfig(
@@ -103,6 +102,8 @@ class WakeWordDetector(
      * 启动唤醒词检测
      */
     fun start() {
+        Log.d(TAG, "=== start: START ===")
+        
         if (spotter == null) {
             Log.e(TAG, "Spotter not initialized")
             return
@@ -113,77 +114,86 @@ class WakeWordDetector(
             return
         }
         
-        // 创建 AudioRecord
-        val channelConfig = if (CHANNELS == 1) {
-            AudioFormat.CHANNEL_IN_MONO
-        } else {
-            AudioFormat.CHANNEL_IN_STEREO
-        }
-        
-        val bufferSize = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE,
-            channelConfig,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-        
-        audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            SAMPLE_RATE,
-            channelConfig,
-            AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize * 2
-        )
-        
-        if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e(TAG, "AudioRecord initialization failed")
-            audioRecord = null
-            return
-        }
-        
-        // 创建检测流
-        stream = spotter!!.createStream()
-        
-        audioRecord?.startRecording()
-        isRunning = true
-        
-        // 启动检测循环
-        detectionJob = scope.launch {
-            // 每 100ms 读取一次音频
-            val samplesPerRead = SAMPLE_RATE / 10 // 1600 samples
-            val buffer = ShortArray(samplesPerRead)
+        try {
+            // 创建 AudioRecord
+            Log.d(TAG, "  - Creating AudioRecord...")
+            val channelConfig = if (CHANNELS == 1) {
+                AudioFormat.CHANNEL_IN_MONO
+            } else {
+                AudioFormat.CHANNEL_IN_STEREO
+            }
             
-            while (isRunning && isActive) {
-                val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
-                if (read > 0) {
-                    // 转换为 float 数组
-                    val samples = FloatArray(read) { i ->
-                        buffer[i] / 32768.0f
-                    }
-                    
-                    // 送入检测器
-                    stream?.let { s ->
-                        s.acceptWaveform(samples, SAMPLE_RATE)
-                        
-                        while (spotter?.isReady(s) == true) {
-                            spotter?.decode(s)
+            val bufferSize = AudioRecord.getMinBufferSize(
+                SAMPLE_RATE,
+                channelConfig,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            Log.d(TAG, "  - Buffer size: $bufferSize")
+            
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                SAMPLE_RATE,
+                channelConfig,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize * 2
+            )
+            
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                Log.e(TAG, "AudioRecord initialization failed, state: ${audioRecord?.state}")
+                audioRecord = null
+                return
+            }
+            Log.d(TAG, "  - AudioRecord initialized")
+            
+            // 创建检测流
+            stream = spotter!!.createStream()
+            Log.d(TAG, "  - Detection stream created")
+            
+            audioRecord?.startRecording()
+            Log.d(TAG, "  - AudioRecord started")
+            isRunning = true
+            
+            // 启动检测循环
+            detectionJob = scope.launch {
+                Log.d(TAG, "  - Detection loop started")
+                // 每 100ms 读取一次音频
+                val samplesPerRead = SAMPLE_RATE / 10 // 1600 samples
+                val buffer = ShortArray(samplesPerRead)
+                
+                while (isRunning && isActive) {
+                    val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
+                    if (read > 0) {
+                        // 转换为 float 数组
+                        val samples = FloatArray(read) { i ->
+                            buffer[i] / 32768.0f
                         }
                         
-                        // 检查是否检测到关键词
-                        val result = spotter?.getResult(s)
-                        if (result != null && result.keyword.isNotEmpty()) {
-                            Log.i(TAG, "Detected keyword: ${result.keyword}")
+                        // 送入检测器
+                        stream?.let { s ->
+                            s.acceptWaveform(samples, SAMPLE_RATE)
                             
-                            // 通知主线程
-                            withContext(Dispatchers.Main) {
-                                onDetected(result.keyword)
+                            while (spotter?.isReady(s) == true) {
+                                spotter?.decode(s)
                             }
                             
-                            // 重置流以检测下一个关键词
-                            spotter?.reset(s)
+                            // 检查是否检测到关键词
+                            val result = spotter?.getResult(s)
+                            if (result != null && result.keyword.isNotEmpty()) {
+                                Log.i(TAG, "Detected keyword: ${result.keyword}")
+                                
+                                // 通知主线程
+                                withContext(Dispatchers.Main) {
+                                    onDetected(result.keyword)
+                                }
+                                // 仅在检测到关键词并处理后，才重置流以检测下一个关键词
+                                spotter?.reset(s)
+                            }
                         }
                     }
                 }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start WakeWordDetector", e)
         }
         
         Log.i(TAG, "WakeWordDetector started")
@@ -193,15 +203,28 @@ class WakeWordDetector(
      * 停止唤醒词检测
      */
     fun stop() {
+        Log.d(TAG, "=== stop: START ===")
+        
         isRunning = false
+        Log.d(TAG, "  - isRunning set to false")
+        
         detectionJob?.cancel()
         detectionJob = null
+        Log.d(TAG, "  - Detection job cancelled")
         
-        audioRecord?.stop()
+        try {
+            audioRecord?.stop()
+            Log.d(TAG, "  - AudioRecord stopped")
+        } catch (e: Exception) {
+            Log.e(TAG, "  - Error stopping AudioRecord", e)
+        }
+        
         audioRecord?.release()
         audioRecord = null
+        Log.d(TAG, "  - AudioRecord released")
         
         stream?.let { spotter?.reset(it) }
+        Log.d(TAG, "=== stop: DONE ===")
         
         Log.i(TAG, "WakeWordDetector stopped")
     }
@@ -236,7 +259,6 @@ class WakeWordDetector(
             val modelPath = File(context.filesDir, MODEL_DIR).absolutePath
             val config = KeywordSpotterConfig(
                 featConfig = com.k2fsa.sherpa.onnx.FeatureConfig(
-                    samplingRate = SAMPLE_RATE,
                     featureDim = 80
                 ),
                 modelConfig = OnlineModelConfig(
