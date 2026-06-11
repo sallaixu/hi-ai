@@ -270,3 +270,15 @@ data class McpToolResponse(
 data class TtsAudioData(
     val opusData: ByteArray
 )
+
+/**
+ * Abort 打断消息（客户端→服务端）
+ * 用于打断正在进行的 TTS 播放
+ */
+@Serializable
+data class AbortRequest(
+    @SerialName("type")
+    override val type: String = "abort",
+    @SerialName("reason")
+    val reason: String? = null // "vad_detected", "wake_word_detected"
+) : WebSocketMessage()
