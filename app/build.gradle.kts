@@ -61,6 +61,9 @@ dependencies {
     // 音频编解码 - Concentus (纯 Java Opus 实现)
     implementation(libs.concentus)
     
+    // VAD 语音活动检测 - android-vad (WebRTC VAD)
+    implementation("com.github.gkonovalov.android-vad:webrtc:2.0.10")
+    
     // 唤醒词检测 - Sherpa-ONNX (本地 AAR)
     implementation(files("libs/sherpa-onnx-1.12.14.aar"))
     

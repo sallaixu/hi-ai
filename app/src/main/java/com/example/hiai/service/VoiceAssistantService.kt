@@ -19,7 +19,10 @@ import com.example.hiai.audio.AudioPlayer
 import com.example.hiai.audio.OpusCodec
 import com.example.hiai.audio.OpusCodecInterface
 import com.example.hiai.audio.WakeWordDetector
-import com.example.hiai.audio.WebRtcVadDetector
+import com.konovalov.vad.webrtc.VadWebRTC
+import com.konovalov.vad.webrtc.config.FrameSize
+import com.konovalov.vad.webrtc.config.Mode
+import com.konovalov.vad.webrtc.config.SampleRate
 import com.example.hiai.data.AppDatabase
 import com.example.hiai.data.DatabaseInitializer
 import com.example.hiai.data.repository.ChatHistoryRepository
@@ -96,7 +99,7 @@ class VoiceAssistantService : Service() {
 
     // VAD 打断功能
     private var isVadInterruptEnabled: Boolean = true
-    private var vadDetector: WebRtcVadDetector? = null
+    private var vadDetector: VadWebRTC? = null
     private var vadCheckJob: Job? = null
     
     // Binder
@@ -182,7 +185,7 @@ class VoiceAssistantService : Service() {
         serviceScope.cancel()
 
         // 释放 VAD 检测器
-        vadDetector?.release()
+        vadDetector?.close()
         vadDetector = null
 
         // 释放唤醒词检测器
@@ -497,18 +500,14 @@ class VoiceAssistantService : Service() {
      */
     private fun initializeVadDetector() {
         try {
-            vadDetector = WebRtcVadDetector(
-                mode = WebRtcVadDetector.VadMode.LOW_BITRATE,  // 中灵敏度
-                sampleRate = 16000
+            vadDetector = VadWebRTC(
+                sampleRate = SampleRate.SAMPLE_RATE_16K,
+                frameSize = FrameSize.FRAME_SIZE_320,
+                mode = Mode.VERY_AGGRESSIVE,
+                silenceDurationMs = 300,
+                speechDurationMs = 50
             )
-
-            if (vadDetector!!.init()) {
-                Log.i(TAG, "VAD detector initialized successfully")
-            } else {
-                Log.e(TAG, "Failed to initialize VAD detector")
-                vadDetector = null
-                isVadInterruptEnabled = false
-            }
+            Log.i(TAG, "VAD detector initialized successfully (android-vad WebRTC)")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create VAD detector", e)
             vadDetector = null
@@ -529,9 +528,10 @@ class VoiceAssistantService : Service() {
             Log.d(TAG, "VAD detection started in Speaking state")
 
             // 创建一个轻量级的录音器用于 VAD 检测
+            // FrameSize.FRAME_SIZE_320 = 320 samples = 640 bytes (16bit) = 20ms at 16KHz
             val vadSampleRate = 16000
-            val vadFrameSizeMs = 10  // 10ms 帧
-            val vadBufferSize = vadSampleRate * vadFrameSizeMs / 1000 * 2  // 字节数
+            val vadFrameSize = 320  // 对应 FrameSize.FRAME_SIZE_320
+            val vadBufferSize = vadFrameSize * 2  // 字节数（16bit = 2 bytes/sample）
 
             val vadAudioRecord = android.media.AudioRecord(
                 android.media.MediaRecorder.AudioSource.MIC,
@@ -547,17 +547,25 @@ class VoiceAssistantService : Service() {
             }
 
             vadAudioRecord.startRecording()
-            val buffer = ShortArray(vadBufferSize / 2)
+            val buffer = ShortArray(vadFrameSize)
+            val byteBuffer = ByteArray(vadBufferSize)
 
             try {
                 while (_serviceState.value == ServiceState.Speaking && isActive) {
                     val read = vadAudioRecord.read(buffer, 0, buffer.size)
-                    if (read > 0 && vadDetector?.detect(buffer) == true) {
-                        Log.i(TAG, "VAD detected speech during TTS playback")
-                        onVadDetected()
-                        break
+                    if (read > 0) {
+                        // ShortArray 转 ByteArray（android-vad 需要 ByteArray）
+                        for (i in buffer.indices) {
+                            byteBuffer[i * 2] = (buffer[i].toInt() and 0xFF).toByte()
+                            byteBuffer[i * 2 + 1] = (buffer[i].toInt() shr 8 and 0xFF).toByte()
+                        }
+                        if (vadDetector?.isSpeech(byteBuffer) == true) {
+                            Log.i(TAG, "VAD detected speech during TTS playback")
+                            onVadDetected()
+                            break
+                        }
                     }
-                    delay(10)  // 10ms 检测间隔
+                    delay(20)  // 20ms 检测间隔（匹配 320 frame size）
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "VAD detection error", e)
@@ -612,22 +620,22 @@ class VoiceAssistantService : Service() {
      *
      * @param mode VAD 模式
      */
-    fun setVadSensitivity(mode: WebRtcVadDetector.VadMode) {
+    fun setVadSensitivity(mode: Mode) {
         Log.d(TAG, "Setting VAD sensitivity to: $mode")
 
         // 释放旧的检测器
-        vadDetector?.release()
+        vadDetector?.close()
 
         // 创建新的检测器
         try {
-            vadDetector = WebRtcVadDetector(mode = mode, sampleRate = 16000)
-            if (vadDetector!!.init()) {
-                Log.i(TAG, "VAD sensitivity changed to: $mode")
-            } else {
-                Log.e(TAG, "Failed to initialize VAD with new sensitivity")
-                vadDetector = null
-                isVadInterruptEnabled = false
-            }
+            vadDetector = VadWebRTC(
+                sampleRate = SampleRate.SAMPLE_RATE_16K,
+                frameSize = FrameSize.FRAME_SIZE_320,
+                mode = mode,
+                silenceDurationMs = 300,
+                speechDurationMs = 50
+            )
+            Log.i(TAG, "VAD sensitivity changed to: $mode")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create VAD detector with new sensitivity", e)
             vadDetector = null
