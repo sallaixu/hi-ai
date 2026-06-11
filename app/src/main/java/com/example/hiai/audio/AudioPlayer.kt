@@ -280,6 +280,16 @@ class AudioPlayer(
     }
 
     /**
+     * 清空音频队列
+     * 用于 VAD 打断时快速清空待播放的音频
+     */
+    fun clearQueue() {
+        val queueSize = audioQueue.size
+        audioQueue.clear()
+        Log.d(TAG, "Audio queue cleared, removed $queueSize items")
+    }
+
+    /**
      * 请求音频焦点
      * 使用 GAIN 而非 GAIN_TRANSIENT_MAY_DUCK，避免被系统降级为静音（OPPO/OnePlus 设备上 duck 可能等于 mute）
      */
