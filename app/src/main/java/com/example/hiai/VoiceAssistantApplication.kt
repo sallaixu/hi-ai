@@ -1,6 +1,7 @@
 package com.example.hiai
 
 import android.app.Application
+import com.example.hiai.di.allModules
 import org.koin.android.ext.koin.androidContext
 import org.koin.android.ext.koin.androidLogger
 import org.koin.core.context.startKoin
@@ -19,8 +20,7 @@ class VoiceAssistantApplication : Application() {
         startKoin {
             androidLogger(Level.ERROR)
             androidContext(this@VoiceAssistantApplication)
-            // TODO: 添加模块
-            // modules(appModule)
+            modules(allModules)
         }
     }
 }
