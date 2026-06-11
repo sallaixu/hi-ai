@@ -318,11 +318,13 @@ class VoiceAssistantService : Service() {
                     Log.d(TAG, "  - WebSocket connect called")
                 } else {
                     Log.e(TAG, "  - OTA response or network manager is null")
+                    stopVadDetection()
                     _serviceState.value = ServiceState.Error
                     messageJob.cancel()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "=== connectToServer: FAILED ===", e)
+                stopVadDetection()
                 _serviceState.value = ServiceState.Error
             }
         }
