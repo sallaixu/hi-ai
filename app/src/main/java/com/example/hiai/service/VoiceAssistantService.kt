@@ -19,6 +19,7 @@ import com.example.hiai.audio.AudioPlayer
 import com.example.hiai.audio.OpusCodec
 import com.example.hiai.audio.OpusCodecInterface
 import com.example.hiai.audio.WakeWordDetector
+import com.example.hiai.audio.WebRtcVadDetector
 import com.example.hiai.data.AppDatabase
 import com.example.hiai.data.DatabaseInitializer
 import com.example.hiai.data.repository.ChatHistoryRepository
@@ -55,6 +56,14 @@ class VoiceAssistantService : Service() {
         object Speaking : ServiceState()
         object Error : ServiceState()
     }
+
+    /**
+     * 监听模式
+     */
+    enum class ListeningMode {
+        REALTIME,    // 实时模式：TTS 结束后继续监听，VAD 可打断
+        MANUAL_STOP  // 手动模式：TTS 结束后回到 Idle（当前行为）
+    }
     
     private val _serviceState = MutableStateFlow<ServiceState>(ServiceState.Idle)
     val serviceState: StateFlow<ServiceState> = _serviceState.asStateFlow()
@@ -81,6 +90,14 @@ class VoiceAssistantService : Service() {
     
     // Hello 响应是否已收到（表示音频参数已确定）
     private var isHelloReceived = false
+
+    // 监听模式（默认实时模式）
+    private var listeningMode: ListeningMode = ListeningMode.REALTIME
+
+    // VAD 打断功能
+    private var isVadInterruptEnabled: Boolean = true
+    private var vadDetector: WebRtcVadDetector? = null
+    private var vadCheckJob: Job? = null
     
     // Binder
     private val binder = LocalBinder()
@@ -96,7 +113,10 @@ class VoiceAssistantService : Service() {
         val database = DatabaseInitializer.getDatabase(this)
         settingRepository = SettingRepository(database.settingDao())
         chatHistoryRepository = ChatHistoryRepository(database.chatHistoryDao())
-        
+
+        // 初始化 VAD 检测器
+        initializeVadDetector()
+
         // 初始化音频组件（使用默认采样率 16000Hz，Hello 响应后可能重新初始化）
         opusCodec = OpusCodec(sampleRate = 16000)
         audioProcessor = AudioProcessor(sampleRate = 16000)
@@ -160,7 +180,11 @@ class VoiceAssistantService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         serviceScope.cancel()
-        
+
+        // 释放 VAD 检测器
+        vadDetector?.release()
+        vadDetector = null
+
         // 释放唤醒词检测器
         wakeWordDetector?.release()
         wakeWordDetector = null
@@ -366,11 +390,29 @@ class VoiceAssistantService : Service() {
                 // 停止录音，避免与播放冲突
                 audioProcessor.stopRecording()
                 _serviceState.value = ServiceState.Speaking
+
+                // 启动 VAD 检测（在 Speaking 状态下）
+                if (isVadInterruptEnabled && vadDetector != null) {
+                    startVadDetection()
+                }
             }
             "stop" -> {
                 Log.d(TAG, "TTS stop received, stopping audio player")
                 audioPlayer.stopPlaying()
-                _serviceState.value = ServiceState.Idle
+
+                // 停止 VAD 检测
+                stopVadDetection()
+
+                // 根据监听模式决定下一步状态
+                if (listeningMode == ListeningMode.REALTIME) {
+                    Log.d(TAG, "Realtime mode: continue listening after TTS")
+                    _serviceState.value = ServiceState.Listening
+                    // 重新开始录音
+                    startRecordingAndUpload()
+                } else {
+                    Log.d(TAG, "Manual mode: back to idle after TTS")
+                    _serviceState.value = ServiceState.Idle
+                }
             }
             else -> {
                 Log.d(TAG, "TTS state: ${message.state}")
@@ -450,6 +492,159 @@ class VoiceAssistantService : Service() {
         }
     }
     
+    /**
+     * 初始化 VAD 检测器
+     */
+    private fun initializeVadDetector() {
+        try {
+            vadDetector = WebRtcVadDetector(
+                mode = WebRtcVadDetector.VadMode.LOW_BITRATE,  // 中灵敏度
+                sampleRate = 16000
+            )
+
+            if (vadDetector!!.init()) {
+                Log.i(TAG, "VAD detector initialized successfully")
+            } else {
+                Log.e(TAG, "Failed to initialize VAD detector")
+                vadDetector = null
+                isVadInterruptEnabled = false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create VAD detector", e)
+            vadDetector = null
+            isVadInterruptEnabled = false
+        }
+    }
+
+    /**
+     * 启动 VAD 检测（在 Speaking 状态下）
+     */
+    private fun startVadDetection() {
+        if (vadCheckJob?.isActive == true) {
+            Log.w(TAG, "VAD detection already running")
+            return
+        }
+
+        vadCheckJob = serviceScope.launch {
+            Log.d(TAG, "VAD detection started in Speaking state")
+
+            // 创建一个轻量级的录音器用于 VAD 检测
+            val vadSampleRate = 16000
+            val vadFrameSizeMs = 10  // 10ms 帧
+            val vadBufferSize = vadSampleRate * vadFrameSizeMs / 1000 * 2  // 字节数
+
+            val vadAudioRecord = android.media.AudioRecord(
+                android.media.MediaRecorder.AudioSource.MIC,
+                vadSampleRate,
+                android.media.AudioFormat.CHANNEL_IN_MONO,
+                android.media.AudioFormat.ENCODING_PCM_16BIT,
+                vadBufferSize * 4  // 4 倍缓冲
+            )
+
+            if (vadAudioRecord.state != android.media.AudioRecord.STATE_INITIALIZED) {
+                Log.e(TAG, "VAD AudioRecord initialization failed")
+                return@launch
+            }
+
+            vadAudioRecord.startRecording()
+            val buffer = ShortArray(vadBufferSize / 2)
+
+            try {
+                while (_serviceState.value == ServiceState.Speaking && isActive) {
+                    val read = vadAudioRecord.read(buffer, 0, buffer.size)
+                    if (read > 0 && vadDetector?.detect(buffer) == true) {
+                        Log.i(TAG, "VAD detected speech during TTS playback")
+                        onVadDetected()
+                        break
+                    }
+                    delay(10)  // 10ms 检测间隔
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "VAD detection error", e)
+            } finally {
+                try {
+                    vadAudioRecord.stop()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to stop VAD AudioRecord", e)
+                }
+                vadAudioRecord.release()
+                Log.d(TAG, "VAD detection stopped")
+            }
+        }
+    }
+
+    /**
+     * 停止 VAD 检测
+     */
+    private fun stopVadDetection() {
+        vadCheckJob?.cancel()
+        vadCheckJob = null
+        Log.d(TAG, "VAD detection job cancelled")
+    }
+
+    /**
+     * VAD 检测到语音时的处理
+     */
+    private fun onVadDetected() {
+        Log.i(TAG, "VAD detected, aborting TTS")
+
+        // 发送 abort 消息到服务端
+        networkManager?.sendAbort(reason = "vad_detected")
+
+        // 停止 TTS 播放
+        audioPlayer.stopPlaying()
+
+        // 清空音频队列
+        audioPlayer.clearQueue()
+
+        // 停止 VAD 检测
+        stopVadDetection()
+
+        // 切换到监听状态
+        _serviceState.value = ServiceState.Listening
+
+        // 重新开始录音
+        startRecordingAndUpload()
+    }
+
+    /**
+     * 设置 VAD 灵敏度
+     *
+     * @param mode VAD 模式
+     */
+    fun setVadSensitivity(mode: WebRtcVadDetector.VadMode) {
+        Log.d(TAG, "Setting VAD sensitivity to: $mode")
+
+        // 释放旧的检测器
+        vadDetector?.release()
+
+        // 创建新的检测器
+        try {
+            vadDetector = WebRtcVadDetector(mode = mode, sampleRate = 16000)
+            if (vadDetector!!.init()) {
+                Log.i(TAG, "VAD sensitivity changed to: $mode")
+            } else {
+                Log.e(TAG, "Failed to initialize VAD with new sensitivity")
+                vadDetector = null
+                isVadInterruptEnabled = false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create VAD detector with new sensitivity", e)
+            vadDetector = null
+            isVadInterruptEnabled = false
+        }
+    }
+
+    /**
+     * 设置监听模式
+     *
+     * @param mode 监听模式
+     */
+    fun setListeningMode(mode: ListeningMode) {
+        Log.d(TAG, "Setting listening mode to: $mode")
+        listeningMode = mode
+    }
+
     /**
      * 开始录音并上传音频流
      */
