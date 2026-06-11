@@ -1,6 +1,7 @@
 package com.example.hiai.network
 
 import android.util.Log
+import com.example.hiai.network.model.AbortRequest
 import com.example.hiai.network.model.HelloRequest
 import com.example.hiai.network.model.HelloResponse
 import com.example.hiai.network.model.ListenRequest
@@ -329,6 +330,22 @@ class NetworkManager(
      */
     fun sendMessage(message: String) {
         webSocket?.send(message)
+    }
+    
+    /**
+     * 发送 abort 消息
+     *
+     * @param reason 打断原因（可选）
+     */
+    fun sendAbort(reason: String? = null) {
+        try {
+            val message = AbortRequest(reason = reason)
+            val jsonStr = json.encodeToString(message)
+            val sent = webSocket?.send(jsonStr)
+            Log.d(TAG, "Sent abort message, reason: $reason, sent: $sent")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to send abort message", e)
+        }
     }
     
     /**
