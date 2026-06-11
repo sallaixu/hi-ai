@@ -110,9 +110,6 @@ class OpusCodec(
     override fun decode(opusData: ByteArray): ByteArray {
         val decoderInstance = decoder ?: throw IllegalStateException("Decoder not initialized")
         
-        // 诊断：打印输入 Opus 数据大小
-        Log.d("OpusCodec", "[DIAG] decode: opusData.size=${opusData.size}, sampleRate=$sampleRate, frameSize=$frameSize")
-        
         // 解码为 PCM
         val output = ShortArray(frameSize)
         val decodedSamples = try {
@@ -133,30 +130,6 @@ class OpusCodec(
             pcmData[i * 2] = (output[i].toInt() and 0xFF).toByte()
             pcmData[i * 2 + 1] = (output[i].toInt() shr 8).toByte()
         }
-        
-        // 诊断：打印解码后的 PCM 样本值（前8个采样点 = 16字节）
-        val samplesHex = pcmData.take(16).joinToString(" ") { "%02x".format(it) }
-        val samplesShort = (0 until minOf(8, decodedSamples)).map { i ->
-            val low = pcmData[i * 2].toInt() and 0xFF
-            val high = pcmData[i * 2 + 1].toInt()
-            val value = (high shl 8) or low
-            if (value >= 0x8000) value - 0x10000 else value
-        }
-        
-        // 诊断：计算 PCM 数据的统计信息（最大值、最小值、RMS）
-        val allSamples = (0 until decodedSamples).map { i ->
-            val low = pcmData[i * 2].toInt() and 0xFF
-            val high = pcmData[i * 2 + 1].toInt()
-            val value = (high shl 8) or low
-            if (value >= 0x8000) value - 0x10000 else value
-        }
-        val maxSample = allSamples.maxOrNull() ?: 0
-        val minSample = allSamples.minOrNull() ?: 0
-        val rms = kotlin.math.sqrt(allSamples.map { it.toLong() * it }.sum().toDouble() / decodedSamples)
-        val peakToPeak = maxSample - minSample
-        
-        Log.d("OpusCodec", "[DIAG] decode: decodedSamples=$decodedSamples, pcm_hex=$samplesHex, pcm_shorts=$samplesShort")
-        Log.d("OpusCodec", "[DIAG] PCM stats: min=$minSample, max=$maxSample, peakToPeak=$peakToPeak, rms=${"%.1f".format(rms)}")
         
         return pcmData
     }

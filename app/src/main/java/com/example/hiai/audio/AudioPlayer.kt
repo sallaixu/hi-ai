@@ -45,7 +45,6 @@ class AudioPlayer(
      * @param opusData Opus 压缩数据
      */
     fun enqueueAudioData(opusData: ByteArray) {
-        Log.d(TAG, "enqueueAudioData: ${opusData.size} bytes, isPlaying=$isPlaying, queueSize=${audioQueue.size}")
         if (isMuted) {
             Log.w(TAG, "AudioPlayer is muted, dropping audio data")
             return
@@ -80,12 +79,9 @@ class AudioPlayer(
                     val opusData = audioQueue.poll()
                     
                     if (opusData != null) {
-                        Log.d(TAG, "Processing Opus data: ${opusData.size} bytes, queue size: ${audioQueue.size}")
                         // 解码为 PCM
                         val pcmData = try {
-                            val decoded = opusCodec.decode(opusData)
-                            Log.d(TAG, "decode success: input size = ${opusData.size}, output pcm size = ${decoded.size}")
-                            decoded
+                            opusCodec.decode(opusData)
                         } catch (e: Exception) {
                             Log.e(TAG, "Failed to decode Opus data, input size = ${opusData.size}", e)
                             continue
@@ -94,7 +90,6 @@ class AudioPlayer(
                         if (pcmData.isNotEmpty()) {
                             // 播放 PCM 数据
                             val written = audioTrack?.write(pcmData, 0, pcmData.size)
-                            Log.d(TAG, "Written to AudioTrack: $written bytes (expected: ${pcmData.size})")
                             if (written != null && written < 0) {
                                 Log.e(TAG, "AudioTrack.write returned error code: $written")
                             }
@@ -119,7 +114,10 @@ class AudioPlayer(
             } catch (e: Exception) {
                 Log.e(TAG, "Audio playback error", e)
             } finally {
-                stopPlaying()
+                // 仅在仍在播放状态时才停止（可能已被外部 stopPlaying 调用停止）
+                if (isPlaying) {
+                    stopPlaying()
+                }
             }
         }
     }
@@ -261,19 +259,25 @@ class AudioPlayer(
         // 释放音频焦点
         abandonAudioFocus()
 
-        // 先 pause 再 stop，确保音频缓冲区被正确刷新
-        audioTrack?.let { track ->
+        // 使用局部引用避免竞态：旧协程 finally 不应误杀新协程创建的 AudioTrack
+        val currentTrack = audioTrack
+        audioTrack = null
+
+        currentTrack?.let { track ->
             if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
                 track.pause()
                 // 刷新剩余数据
                 track.flush()
                 Log.d(TAG, "AudioTrack paused and flushed")
             }
-            track.stop()
+            try {
+                track.stop()
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "AudioTrack already stopped or released", e)
+            }
             track.release()
             Log.d(TAG, "AudioTrack stopped and released")
         }
-        audioTrack = null
         
         audioQueue.clear()
         Log.d(TAG, "Audio playback stopped")

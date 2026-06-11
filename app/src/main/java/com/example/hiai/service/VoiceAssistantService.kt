@@ -101,6 +101,11 @@ class VoiceAssistantService : Service() {
     private var isVadInterruptEnabled: Boolean = true
     private var vadDetector: VadWebRTC? = null
     private var vadCheckJob: Job? = null
+
+    // VAD 打断参数（防止误触发）
+    private val vadStartDelayMs: Long = 1500L  // TTS 开始后延迟 1.5 秒再启动 VAD
+    private val vadEnergyThreshold: Int = 800   // 语音能量阈值（PCM 绝对值平均值）
+    private val vadSpeechFrames: Int = 60       // 需要 60 帧（1.2 秒）连续语音才触发打断
     
     // Binder
     private val binder = LocalBinder()
@@ -272,7 +277,6 @@ class VoiceAssistantService : Service() {
                 Log.d(TAG, "  - Starting message flow listener...")
                 val messageJob = launch {
                     networkManager?.messageFlow?.collect { message ->
-                        Log.d(TAG, "    - Received message: ${message::class.java.simpleName}, type: ${message::class.java.name}")
                         when (message) {
                             is HelloResponse -> {
                                 Log.d(TAG, "      -> Handling HelloResponse")
@@ -287,7 +291,6 @@ class VoiceAssistantService : Service() {
                                 handleTtsMessage(message)
                             }
                             is TtsAudioData -> {
-                                Log.d(TAG, "      -> Handling TtsAudioData")
                                 handleTtsAudioData(message)
                             }
                             else -> {
@@ -429,7 +432,6 @@ class VoiceAssistantService : Service() {
      * 处理 TTS 音频数据
      */
     private fun handleTtsAudioData(data: TtsAudioData) {
-        Log.d(TAG, "handleTtsAudioData: ${data.opusData.size} bytes")
         // 将 Opus 数据送入播放器
         audioPlayer.enqueueAudioData(data.opusData)
     }
@@ -505,11 +507,12 @@ class VoiceAssistantService : Service() {
             vadDetector = VadWebRTC(
                 sampleRate = SampleRate.SAMPLE_RATE_16K,
                 frameSize = FrameSize.FRAME_SIZE_320,
-                mode = Mode.VERY_AGGRESSIVE,
+                mode = Mode.LOW_BITRATE,  // 使用 LOW_BITRATE 降低灵敏度，减少回声误触发
                 silenceDurationMs = 300,
-                speechDurationMs = 50
+                speechDurationMs = 800  // 连续 800ms 语音才确认，过滤短促回声
             )
-            Log.i(TAG, "VAD detector initialized successfully (android-vad WebRTC)")
+            isVadInterruptEnabled = true
+            Log.i(TAG, "VAD detector initialized successfully (android-vad WebRTC, LOW_BITRATE mode, speechDuration=800ms)")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create VAD detector", e)
             vadDetector = null
@@ -519,6 +522,11 @@ class VoiceAssistantService : Service() {
 
     /**
      * 启动 VAD 检测（在 Speaking 状态下）
+     * 
+     * 关键改进：
+     * 1. 延迟启动：TTS 开始后 1.5 秒再启动 VAD，避免初始阶段误触发
+     * 2. 能量阈值：只有音频能量超过阈值才认为是语音，过滤 TTS 残留回声
+     * 3. 连续帧数：需要更长连续语音帧才触发打断
      */
     private fun startVadDetection() {
         if (vadCheckJob?.isActive == true) {
@@ -527,7 +535,18 @@ class VoiceAssistantService : Service() {
         }
 
         vadCheckJob = serviceScope.launch {
-            Log.d(TAG, "VAD detection started in Speaking state")
+            Log.d(TAG, "VAD detection waiting for delay ($vadStartDelayMs ms)...")
+            
+            // 延迟启动 VAD，避免 TTS 初始播放阶段误触发
+            kotlinx.coroutines.delay(vadStartDelayMs)
+            
+            // 检查是否仍在 Speaking 状态（可能 TTS 已结束）
+            if (_serviceState.value != ServiceState.Speaking) {
+                Log.d(TAG, "VAD detection cancelled: state changed to ${_serviceState.value}")
+                return@launch
+            }
+            
+            Log.d(TAG, "VAD detection started in Speaking state (after delay)")
 
             // 创建一个轻量级的录音器用于 VAD 检测
             // FrameSize.FRAME_SIZE_320 = 320 samples = 640 bytes (16bit) = 20ms at 16KHz
@@ -536,7 +555,7 @@ class VoiceAssistantService : Service() {
             val vadBufferSize = vadFrameSize * 2  // 字节数（16bit = 2 bytes/sample）
 
             val vadAudioRecord = android.media.AudioRecord(
-                android.media.MediaRecorder.AudioSource.MIC,
+                android.media.MediaRecorder.AudioSource.VOICE_COMMUNICATION,  // AEC 回声消除
                 vadSampleRate,
                 android.media.AudioFormat.CHANNEL_IN_MONO,
                 android.media.AudioFormat.ENCODING_PCM_16BIT,
@@ -551,23 +570,45 @@ class VoiceAssistantService : Service() {
             vadAudioRecord.startRecording()
             val buffer = ShortArray(vadFrameSize)
             val byteBuffer = ByteArray(vadBufferSize)
+            var speechFrameCount = 0
 
             try {
                 while (_serviceState.value == ServiceState.Speaking && isActive) {
                     val read = vadAudioRecord.read(buffer, 0, buffer.size)
-                    if (read > 0) {
-                        // ShortArray 转 ByteArray（android-vad 需要 ByteArray）
+                    if (read == vadFrameSize) {
+                        // 计算音频能量（PCM 绝对值平均值）
+                        val energy = buffer.map { kotlin.math.abs(it.toInt()) }.average().toInt()
+                        
+                        // 转换为字节格式用于 VAD 检测
                         for (i in buffer.indices) {
                             byteBuffer[i * 2] = (buffer[i].toInt() and 0xFF).toByte()
                             byteBuffer[i * 2 + 1] = (buffer[i].toInt() shr 8 and 0xFF).toByte()
                         }
-                        if (vadDetector?.isSpeech(byteBuffer) == true) {
-                            Log.i(TAG, "VAD detected speech during TTS playback")
-                            onVadDetected()
-                            break
+                        
+                        // 双重条件：VAD 检测 + 能量阈值
+                        // 只有能量足够高才认为是真正的用户语音
+                        val vadDetected = vadDetector?.isSpeech(byteBuffer) == true
+                        val energyOk = energy > vadEnergyThreshold
+                        
+                        if (vadDetected && energyOk) {
+                            speechFrameCount++
+                            if (speechFrameCount % 10 == 0) {  // 每 200ms 打印一次进度
+                                Log.d(TAG, "VAD progress: $speechFrameCount/$vadSpeechFrames frames, energy=$energy")
+                            }
+                            if (speechFrameCount >= vadSpeechFrames) {
+                                Log.i(TAG, "VAD detected continuous speech ($speechFrameCount frames ≈ ${speechFrameCount * 20}ms, avg energy=$energy)")
+                                onVadDetected()
+                                break
+                            }
+                        } else {
+                            // 非语音帧或能量不足，重置计数
+                            if (speechFrameCount > 0) {
+                                Log.d(TAG, "VAD reset: vad=$vadDetected, energy=$energy (threshold=$vadEnergyThreshold)")
+                            }
+                            speechFrameCount = 0
                         }
                     }
-                    delay(20)  // 20ms 检测间隔（匹配 320 frame size）
+                    // 不需要 delay，AudioRecord.read 是阻塞的，每帧约 20ms
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "VAD detection error", e)

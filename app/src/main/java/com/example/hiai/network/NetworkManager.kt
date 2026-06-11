@@ -268,16 +268,13 @@ class NetworkManager(
             }
             
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                Log.d(TAG, "  - Received binary message: ${bytes.size} bytes")
                 // 二进制消息（Opus 音频数据）
                 val opusData = bytes.toByteArray()
-                Log.d(TAG, "  - Emitting TtsAudioData: ${opusData.size} bytes, flow has collectors: ${_messageFlow.subscriptionCount.value}")
                 // 将 Opus 数据通过消息流发送给监听者
                 // 使用 runBlocking 确保消息被发送
                 kotlinx.coroutines.runBlocking {
                     _messageFlow.emit(TtsAudioData(opusData))
                 }
-                Log.d(TAG, "  - TtsAudioData emitted")
             }
             
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
