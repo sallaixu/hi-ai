@@ -18,7 +18,7 @@ fun VoiceAssistantTheme(
         SideEffect {
             val window = (view.context as Activity).window
             window.statusBarColor = if (darkTheme) {
-                DeskModeBackground.toArgb()
+                DeskModeBlack.toArgb()
             } else {
                 Purple40.toArgb()
             }

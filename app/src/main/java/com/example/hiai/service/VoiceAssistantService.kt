@@ -19,10 +19,6 @@ import com.example.hiai.audio.AudioPlayer
 import com.example.hiai.audio.OpusCodec
 import com.example.hiai.audio.OpusCodecInterface
 import com.example.hiai.audio.WakeWordDetector
-import com.konovalov.vad.webrtc.VadWebRTC
-import com.konovalov.vad.webrtc.config.FrameSize
-import com.konovalov.vad.webrtc.config.Mode
-import com.konovalov.vad.webrtc.config.SampleRate
 import com.example.hiai.data.AppDatabase
 import com.example.hiai.data.DatabaseInitializer
 import com.example.hiai.data.repository.ChatHistoryRepository
@@ -74,6 +70,18 @@ class VoiceAssistantService : Service() {
     private val _isDeskMode = MutableStateFlow(false)
     val isDeskMode: StateFlow<Boolean> = _isDeskMode.asStateFlow()
     
+    // 连接状态：true 表示已连接，false 表示已断开
+    private val _isConnected = MutableStateFlow(false)
+    val isConnected: StateFlow<Boolean> = _isConnected.asStateFlow()
+    
+    // 当前 TTS 文本（空表示无 TTS 正在播放）
+    private val _ttsText = MutableStateFlow("")
+    val ttsText: StateFlow<String> = _ttsText.asStateFlow()
+    
+    // TTS 消息历史（保留最近的消息用于界面滚动显示）
+    private val _ttsMessages = MutableStateFlow<List<String>>(emptyList())
+    val ttsMessages: StateFlow<List<String>> = _ttsMessages.asStateFlow()
+    
     // 组件
     private var networkManager: NetworkManager? = null
     private lateinit var audioProcessor: AudioProcessor
@@ -88,6 +96,16 @@ class VoiceAssistantService : Service() {
     // 协程
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     
+    // 消息监听 Job（需要在重连时取消旧的，避免重复处理）
+    private var messageJob: Job? = null
+    
+    // 屏幕常亮 WakeLock（桌面模式使用）
+    private var screenWakeLock: android.os.PowerManager.WakeLock? = null
+    
+    // 防止唤醒词并发重连
+    @Volatile
+    private var isReconnecting = false
+    
     // 网络管理器初始化状态
     private var isNetworkManagerInitialized = false
     
@@ -97,21 +115,59 @@ class VoiceAssistantService : Service() {
     // 监听模式（默认实时模式）
     private var listeningMode: ListeningMode = ListeningMode.REALTIME
 
-    // VAD 打断功能
-    private var isVadInterruptEnabled: Boolean = true
-    private var vadDetector: VadWebRTC? = null
-    private var vadCheckJob: Job? = null
-
-    // VAD 打断参数（防止误触发）
-    private val vadStartDelayMs: Long = 1500L  // TTS 开始后延迟 1.5 秒再启动 VAD
-    private val vadEnergyThreshold: Int = 800   // 语音能量阈值（PCM 绝对值平均值）
-    private val vadSpeechFrames: Int = 60       // 需要 60 帧（1.2 秒）连续语音才触发打断
-    
     // Binder
     private val binder = LocalBinder()
     
     inner class LocalBinder : Binder() {
         fun getService(): VoiceAssistantService = this@VoiceAssistantService
+    }
+    
+    companion object {
+        private const val TAG = "VoiceAssistantService"
+        const val ACTION_START = "com.example.hiai.START_SERVICE"
+        const val ACTION_STOP = "com.example.hiai.STOP_SERVICE"
+        const val ACTION_TOGGLE_DESK_MODE = "com.example.hiai.TOGGLE_DESK_MODE"
+        const val CHANNEL_ID = "voice_assistant_channel"
+        const val NOTIFICATION_ID = 1001
+        private const val KEY_WAKE_WORDS = "wake_words"
+        
+        // 默认唤醒词
+        val DEFAULT_WAKE_WORDS = listOf(
+            "n ǐ h ǎo x iǎo zh ì @你好小智",
+            "h ēi n ǐ h ǎo y a @嘿你好呀"
+        )
+    }
+    
+    /**
+     * 获取当前唤醒词列表
+     */
+    fun getWakeWords(): List<String> {
+        val saved = runCatching { 
+            kotlinx.coroutines.runBlocking {
+                settingRepository.get(KEY_WAKE_WORDS)
+            }
+        }.getOrNull()
+        
+        return if (saved.isNullOrBlank()) {
+            DEFAULT_WAKE_WORDS
+        } else {
+            saved.split("\n").filter { it.isNotBlank() }
+        }
+    }
+    
+    /**
+     * 更新唤醒词列表
+     */
+    fun updateWakeWords(keywords: List<String>): Boolean {
+        val result = wakeWordDetector?.updateKeywords(keywords) ?: false
+        if (result) {
+            runCatching {
+                kotlinx.coroutines.runBlocking {
+                    settingRepository.set(KEY_WAKE_WORDS, keywords.joinToString("\n"))
+                }
+            }
+        }
+        return result
     }
     
     override fun onCreate() {
@@ -121,9 +177,6 @@ class VoiceAssistantService : Service() {
         val database = DatabaseInitializer.getDatabase(this)
         settingRepository = SettingRepository(database.settingDao())
         chatHistoryRepository = ChatHistoryRepository(database.chatHistoryDao())
-
-        // 初始化 VAD 检测器
-        initializeVadDetector()
 
         // 初始化音频组件（使用默认采样率 16000Hz，Hello 响应后可能重新初始化）
         opusCodec = OpusCodec(sampleRate = 16000)
@@ -189,10 +242,9 @@ class VoiceAssistantService : Service() {
         super.onDestroy()
         serviceScope.cancel()
 
-        // 释放 VAD 检测器
-        vadDetector?.close()
-        vadDetector = null
-
+        // 释放屏幕常亮 WakeLock
+        releaseScreenWakeLock()
+        
         // 释放唤醒词检测器
         wakeWordDetector?.release()
         wakeWordDetector = null
@@ -275,11 +327,22 @@ class VoiceAssistantService : Service() {
             try {
                 // 先开始监听消息（在连接之前），避免丢失 Hello 响应
                 Log.d(TAG, "  - Starting message flow listener...")
-                val messageJob = launch {
+                // 取消旧的消息监听，避免重连时出现重复 collector
+                messageJob?.cancel()
+                messageJob = launch {
                     networkManager?.messageFlow?.collect { message ->
                         when (message) {
+                            is String -> {
+                                if (message == "websocket_disconnected") {
+                                    Log.d(TAG, "      -> WebSocket disconnected")
+                                    _isConnected.value = false
+                                    _ttsText.value = ""
+                                    _ttsMessages.value = emptyList()
+                                }
+                            }
                             is HelloResponse -> {
                                 Log.d(TAG, "      -> Handling HelloResponse")
+                                _isConnected.value = true
                                 handleHelloResponse(message)
                             }
                             is SttMessage -> {
@@ -321,13 +384,11 @@ class VoiceAssistantService : Service() {
                     Log.d(TAG, "  - WebSocket connect called")
                 } else {
                     Log.e(TAG, "  - OTA response or network manager is null")
-                    stopVadDetection()
                     _serviceState.value = ServiceState.Error
-                    messageJob.cancel()
+                    messageJob?.cancel()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "=== connectToServer: FAILED ===", e)
-                stopVadDetection()
                 _serviceState.value = ServiceState.Error
             }
         }
@@ -369,9 +430,7 @@ class VoiceAssistantService : Service() {
         isHelloReceived = true
         Log.d(TAG, "Hello response processed, isHelloReceived=true")
         
-        // 发送聆听状态（唤醒检测）
-        networkManager?.sendListen(state = "detect")
-        
+        // 保持本地唤醒检测，不再发送空的 listen.detect 给服务端，避免服务端把 null text 当成有效文本处理
         _serviceState.value = ServiceState.Idle
     }
     
@@ -398,18 +457,12 @@ class VoiceAssistantService : Service() {
                 // 停止录音，避免与播放冲突
                 audioProcessor.stopRecording()
                 _serviceState.value = ServiceState.Speaking
-
-                // 启动 VAD 检测（在 Speaking 状态下）
-                if (isVadInterruptEnabled && vadDetector != null) {
-                    startVadDetection()
-                }
+                _ttsText.value = message.text ?: ""
+                addTtsMessage(message.text ?: "")
             }
             "stop" -> {
                 Log.d(TAG, "TTS stop received, stopping audio player")
                 audioPlayer.stopPlaying()
-
-                // 停止 VAD 检测
-                stopVadDetection()
 
                 // 根据监听模式决定下一步状态
                 if (listeningMode == ListeningMode.REALTIME) {
@@ -422,9 +475,37 @@ class VoiceAssistantService : Service() {
                     _serviceState.value = ServiceState.Idle
                 }
             }
+            "sentence_start" -> {
+                // 检查当前状态：如果已经被 VAD 打断（状态不是 Speaking），忽略后续 TTS 数据
+                val currentState = _serviceState.value
+                if (currentState != ServiceState.Speaking) {
+                    Log.w(TAG, "TTS sentence_start received but state=$currentState (already interrupted), ignoring")
+                    // 确保停止播放
+                    audioPlayer.stopPlaying()
+                    audioPlayer.clearQueue()
+                    return
+                }
+                Log.d(TAG, "TTS state: sentence_start")
+                _ttsText.value = message.text ?: ""
+                addTtsMessage(message.text ?: "")
+            }
             else -> {
                 Log.d(TAG, "TTS state: ${message.state}")
             }
+        }
+    }
+    
+    private fun addTtsMessage(text: String) {
+        if (text.isBlank()) return
+        val current = _ttsMessages.value.toMutableList()
+        // 避免重复添加相同文本
+        if (current.lastOrNull() == text) return
+        current.add(text)
+        // 只保留最近 20 条
+        if (current.size > 20) {
+            _ttsMessages.value = current.takeLast(20)
+        } else {
+            _ttsMessages.value = current
         }
     }
     
@@ -453,15 +534,50 @@ class VoiceAssistantService : Service() {
                 wakeWordDetector?.start()
                 Log.d(TAG, "  - Wake word detector started")
                 Log.i(TAG, "Desktop mode enabled, wake word detection started")
+                
+                // 获取屏幕常亮 WakeLock
+                acquireScreenWakeLock()
             } else {
                 // 退出桌面模式，停止唤醒词检测
                 Log.d(TAG, "  - Stopping wake word detector...")
                 wakeWordDetector?.stop()
                 Log.d(TAG, "  - Wake word detector stopped")
                 Log.i(TAG, "Desktop mode disabled, wake word detection stopped")
+                
+                // 释放屏幕常亮 WakeLock
+                releaseScreenWakeLock()
             }
         } catch (e: Exception) {
             Log.e(TAG, "=== toggleDeskMode: FAILED ===", e)
+        }
+    }
+    
+    private fun acquireScreenWakeLock() {
+        try {
+            if (screenWakeLock?.isHeld == true) return
+            
+            val powerManager = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            screenWakeLock = powerManager.newWakeLock(
+                android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
+                android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "hiai::DeskModeScreen"
+            )
+            screenWakeLock?.acquire()
+            Log.d(TAG, "Screen WakeLock acquired")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to acquire screen WakeLock", e)
+        }
+    }
+    
+    private fun releaseScreenWakeLock() {
+        try {
+            if (screenWakeLock?.isHeld == true) {
+                screenWakeLock?.release()
+                Log.d(TAG, "Screen WakeLock released")
+            }
+            screenWakeLock = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to release screen WakeLock", e)
         }
     }
     
@@ -469,9 +585,15 @@ class VoiceAssistantService : Service() {
      * 唤醒词触发回调
      */
     private fun onWakeWordDetected(keyword: String) {
-        Log.i(TAG, "Wake word detected: $keyword")
-        
-        // 等待 WebSocket 连接和 Hello 响应
+        Log.i(TAG, "Wake word detected: $keyword, state=${_serviceState.value}")
+
+        // 防止并发重连：如果正在重连中，忽略新的唤醒
+        if (isReconnecting) {
+            Log.w(TAG, "Already reconnecting, ignoring wake word")
+            return
+        }
+
+        // 等待 WebSocket 连接和 Hello 响应，如果断连则自动重连
         serviceScope.launch {
             Log.d(TAG, "Waiting for WebSocket connection and Hello response...")
             var waitCount = 0
@@ -479,14 +601,42 @@ class VoiceAssistantService : Service() {
                 if (waitCount % 10 == 0) {  // 每 1 秒打印一次日志
                     Log.d(TAG, "  - isHelloReceived=$isHelloReceived, isConnected=${networkManager?.isConnectionOpen()}")
                 }
+                
+                // 如果 WebSocket 断开，尝试自动重连
+                if (networkManager?.isConnectionOpen() == false) {
+                    if (isReconnecting) {
+                        // 已有重连流程在运行，等待即可
+                        Log.d(TAG, "  - Reconnection already in progress, waiting...")
+                    } else {
+                        isReconnecting = true
+                        try {
+                            Log.d(TAG, "  - WebSocket disconnected, attempting to reconnect...")
+                            // 重新获取 OTA 信息并连接
+                            val otaResponse = networkManager?.fetchOtaInfo()
+                            if (otaResponse != null) {
+                                Log.d(TAG, "  - Reconnecting to WebSocket: ${otaResponse.websocket.url}")
+                                networkManager?.connect(otaResponse.websocket.url, otaResponse.websocket.token)
+                            } else {
+                                Log.e(TAG, "  - Failed to fetch OTA info for reconnection")
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "  - Reconnection attempt failed", e)
+                        } finally {
+                            isReconnecting = false
+                        }
+                    }
+                }
+                
                 kotlinx.coroutines.delay(100)
                 waitCount++
                 if (waitCount > 100) {  // 超时 10 秒
                     Log.e(TAG, "Timeout waiting for WebSocket connection and Hello response")
+                    isReconnecting = false
                     return@launch
                 }
             }
             Log.d(TAG, "WebSocket connected and Hello received, proceeding with wake word handling")
+            isReconnecting = false
             
             // 发送 listen 消息，开始录音上传
             networkManager?.sendListen(state = "start", text = keyword)
@@ -496,193 +646,6 @@ class VoiceAssistantService : Service() {
             
             // 开始录音并上传音频流
             startRecordingAndUpload()
-        }
-    }
-    
-    /**
-     * 初始化 VAD 检测器
-     */
-    private fun initializeVadDetector() {
-        try {
-            vadDetector = VadWebRTC(
-                sampleRate = SampleRate.SAMPLE_RATE_16K,
-                frameSize = FrameSize.FRAME_SIZE_320,
-                mode = Mode.LOW_BITRATE,  // 使用 LOW_BITRATE 降低灵敏度，减少回声误触发
-                silenceDurationMs = 300,
-                speechDurationMs = 800  // 连续 800ms 语音才确认，过滤短促回声
-            )
-            isVadInterruptEnabled = true
-            Log.i(TAG, "VAD detector initialized successfully (android-vad WebRTC, LOW_BITRATE mode, speechDuration=800ms)")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to create VAD detector", e)
-            vadDetector = null
-            isVadInterruptEnabled = false
-        }
-    }
-
-    /**
-     * 启动 VAD 检测（在 Speaking 状态下）
-     * 
-     * 关键改进：
-     * 1. 延迟启动：TTS 开始后 1.5 秒再启动 VAD，避免初始阶段误触发
-     * 2. 能量阈值：只有音频能量超过阈值才认为是语音，过滤 TTS 残留回声
-     * 3. 连续帧数：需要更长连续语音帧才触发打断
-     */
-    private fun startVadDetection() {
-        if (vadCheckJob?.isActive == true) {
-            Log.w(TAG, "VAD detection already running")
-            return
-        }
-
-        vadCheckJob = serviceScope.launch {
-            Log.d(TAG, "VAD detection waiting for delay ($vadStartDelayMs ms)...")
-            
-            // 延迟启动 VAD，避免 TTS 初始播放阶段误触发
-            kotlinx.coroutines.delay(vadStartDelayMs)
-            
-            // 检查是否仍在 Speaking 状态（可能 TTS 已结束）
-            if (_serviceState.value != ServiceState.Speaking) {
-                Log.d(TAG, "VAD detection cancelled: state changed to ${_serviceState.value}")
-                return@launch
-            }
-            
-            Log.d(TAG, "VAD detection started in Speaking state (after delay)")
-
-            // 创建一个轻量级的录音器用于 VAD 检测
-            // FrameSize.FRAME_SIZE_320 = 320 samples = 640 bytes (16bit) = 20ms at 16KHz
-            val vadSampleRate = 16000
-            val vadFrameSize = 320  // 对应 FrameSize.FRAME_SIZE_320
-            val vadBufferSize = vadFrameSize * 2  // 字节数（16bit = 2 bytes/sample）
-
-            val vadAudioRecord = android.media.AudioRecord(
-                android.media.MediaRecorder.AudioSource.VOICE_COMMUNICATION,  // AEC 回声消除
-                vadSampleRate,
-                android.media.AudioFormat.CHANNEL_IN_MONO,
-                android.media.AudioFormat.ENCODING_PCM_16BIT,
-                vadBufferSize * 4  // 4 倍缓冲
-            )
-
-            if (vadAudioRecord.state != android.media.AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "VAD AudioRecord initialization failed")
-                return@launch
-            }
-
-            vadAudioRecord.startRecording()
-            val buffer = ShortArray(vadFrameSize)
-            val byteBuffer = ByteArray(vadBufferSize)
-            var speechFrameCount = 0
-
-            try {
-                while (_serviceState.value == ServiceState.Speaking && isActive) {
-                    val read = vadAudioRecord.read(buffer, 0, buffer.size)
-                    if (read == vadFrameSize) {
-                        // 计算音频能量（PCM 绝对值平均值）
-                        val energy = buffer.map { kotlin.math.abs(it.toInt()) }.average().toInt()
-                        
-                        // 转换为字节格式用于 VAD 检测
-                        for (i in buffer.indices) {
-                            byteBuffer[i * 2] = (buffer[i].toInt() and 0xFF).toByte()
-                            byteBuffer[i * 2 + 1] = (buffer[i].toInt() shr 8 and 0xFF).toByte()
-                        }
-                        
-                        // 双重条件：VAD 检测 + 能量阈值
-                        // 只有能量足够高才认为是真正的用户语音
-                        val vadDetected = vadDetector?.isSpeech(byteBuffer) == true
-                        val energyOk = energy > vadEnergyThreshold
-                        
-                        if (vadDetected && energyOk) {
-                            speechFrameCount++
-                            if (speechFrameCount % 10 == 0) {  // 每 200ms 打印一次进度
-                                Log.d(TAG, "VAD progress: $speechFrameCount/$vadSpeechFrames frames, energy=$energy")
-                            }
-                            if (speechFrameCount >= vadSpeechFrames) {
-                                Log.i(TAG, "VAD detected continuous speech ($speechFrameCount frames ≈ ${speechFrameCount * 20}ms, avg energy=$energy)")
-                                onVadDetected()
-                                break
-                            }
-                        } else {
-                            // 非语音帧或能量不足，重置计数
-                            if (speechFrameCount > 0) {
-                                Log.d(TAG, "VAD reset: vad=$vadDetected, energy=$energy (threshold=$vadEnergyThreshold)")
-                            }
-                            speechFrameCount = 0
-                        }
-                    }
-                    // 不需要 delay，AudioRecord.read 是阻塞的，每帧约 20ms
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "VAD detection error", e)
-            } finally {
-                try {
-                    vadAudioRecord.stop()
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to stop VAD AudioRecord", e)
-                }
-                vadAudioRecord.release()
-                Log.d(TAG, "VAD detection stopped")
-            }
-        }
-    }
-
-    /**
-     * 停止 VAD 检测
-     */
-    private fun stopVadDetection() {
-        vadCheckJob?.cancel()
-        vadCheckJob = null
-        Log.d(TAG, "VAD detection job cancelled")
-    }
-
-    /**
-     * VAD 检测到语音时的处理
-     */
-    private fun onVadDetected() {
-        Log.i(TAG, "VAD detected, aborting TTS")
-
-        // 发送 abort 消息到服务端
-        networkManager?.sendAbort(reason = "vad_detected")
-
-        // 停止 TTS 播放
-        audioPlayer.stopPlaying()
-
-        // 清空音频队列
-        audioPlayer.clearQueue()
-
-        // 停止 VAD 检测
-        stopVadDetection()
-
-        // 切换到监听状态
-        _serviceState.value = ServiceState.Listening
-
-        // 重新开始录音
-        startRecordingAndUpload()
-    }
-
-    /**
-     * 设置 VAD 灵敏度
-     *
-     * @param mode VAD 模式
-     */
-    fun setVadSensitivity(mode: Mode) {
-        Log.d(TAG, "Setting VAD sensitivity to: $mode")
-
-        // 释放旧的检测器
-        vadDetector?.close()
-
-        // 创建新的检测器
-        try {
-            vadDetector = VadWebRTC(
-                sampleRate = SampleRate.SAMPLE_RATE_16K,
-                frameSize = FrameSize.FRAME_SIZE_320,
-                mode = mode,
-                silenceDurationMs = 300,
-                speechDurationMs = 50
-            )
-            Log.i(TAG, "VAD sensitivity changed to: $mode")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to create VAD detector with new sensitivity", e)
-            vadDetector = null
-            isVadInterruptEnabled = false
         }
     }
 
@@ -730,16 +693,5 @@ class VoiceAssistantService : Service() {
      */
     private fun getDeviceIdString(): String {
         return Build.SERIAL.ifBlank { "unknown" }
-    }
-    
-    companion object {
-        const val ACTION_START = "com.example.hiai.START_SERVICE"
-        const val ACTION_STOP = "com.example.hiai.STOP_SERVICE"
-        const val ACTION_TOGGLE_DESK_MODE = "com.example.hiai.TOGGLE_DESK_MODE"
-        
-        const val CHANNEL_ID = "voice_assistant_channel"
-        const val NOTIFICATION_ID = 1001
-        
-        private const val TAG = "VoiceAssistantService"
     }
 }

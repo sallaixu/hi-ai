@@ -175,7 +175,8 @@ class AudioPlayer(
             audioTrack = audioTrackBuilder.build()
 
             val state = audioTrack?.state
-            Log.d(TAG, "AudioTrack state: $state (INITIALIZED=${AudioTrack.STATE_INITIALIZED})")
+            val sessionId = audioTrack?.audioSessionId ?: 0
+            Log.d(TAG, "AudioTrack state: $state, sessionId: $sessionId (INITIALIZED=${AudioTrack.STATE_INITIALIZED})")
             
             if (state != AudioTrack.STATE_INITIALIZED) {
                 Log.e(TAG, "AudioTrack init FAILED! state=$state")

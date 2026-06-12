@@ -10,6 +10,7 @@ import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -18,6 +19,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -28,6 +31,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
@@ -51,6 +55,10 @@ class MainActivity : ComponentActivity() {
     private var isDeskMode by mutableStateOf(false)
     private var hasPermission by mutableStateOf(false)
     private var showServerConfigDialog by mutableStateOf(false)
+    private var showWakeWordConfigDialog by mutableStateOf(false)
+    private var isConnected by mutableStateOf(false)
+    private var ttsText by mutableStateOf("")
+    private var ttsMessages by mutableStateOf<List<String>>(emptyList())
     
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -67,6 +75,24 @@ class MainActivity : ComponentActivity() {
             lifecycleScope.launchWhenStarted {
                 service?.isDeskMode?.collect { deskMode ->
                     isDeskMode = deskMode
+                }
+            }
+            
+            lifecycleScope.launchWhenStarted {
+                service?.isConnected?.collect { connected ->
+                    isConnected = connected
+                }
+            }
+            
+            lifecycleScope.launchWhenStarted {
+                service?.ttsText?.collect { text ->
+                    ttsText = text
+                }
+            }
+            
+            lifecycleScope.launchWhenStarted {
+                service?.ttsMessages?.collect { messages ->
+                    ttsMessages = messages
                 }
             }
         }
@@ -99,6 +125,9 @@ class MainActivity : ComponentActivity() {
                     )
                 } else if (isDeskMode) {
                     DeskModeScreen(
+                        isConnected = isConnected,
+                        ttsText = ttsText,
+                        ttsMessages = ttsMessages,
                         serviceState = serviceState,
                         onToggleDeskMode = { toggleDeskMode() },
                         modifier = Modifier.fillMaxSize()
@@ -107,6 +136,7 @@ class MainActivity : ComponentActivity() {
                     NormalModeScreen(
                         onToggleDeskMode = { toggleDeskMode() },
                         onShowServerConfig = { showServerConfigDialog = true },
+                        onShowWakeWordConfig = { showWakeWordConfigDialog = true },
                         modifier = Modifier.fillMaxSize()
                     )
                 }
@@ -117,6 +147,18 @@ class MainActivity : ComponentActivity() {
                         onDismiss = { showServerConfigDialog = false },
                         onSave = { serverUrl, deviceId, token ->
                             saveServerConfig(serverUrl, deviceId, token)
+                        }
+                    )
+                }
+                
+                // 唤醒词配置对话框
+                if (showWakeWordConfigDialog) {
+                    WakeWordConfigDialog(
+                        currentKeywords = service?.getWakeWords() ?: VoiceAssistantService.DEFAULT_WAKE_WORDS,
+                        onDismiss = { showWakeWordConfigDialog = false },
+                        onSave = { keywords ->
+                            val success = service?.updateWakeWords(keywords) ?: false
+                            showWakeWordConfigDialog = false
                         }
                     )
                 }
@@ -168,6 +210,15 @@ class MainActivity : ComponentActivity() {
             action = VoiceAssistantService.ACTION_TOGGLE_DESK_MODE
         }
         startService(intent)
+        
+        // 切换屏幕常亮状态
+        if (isDeskMode) {
+            // 退出桌面模式，清除屏幕常亮
+            window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            // 进入桌面模式，设置屏幕常亮
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
     }
     
     /**
@@ -231,6 +282,87 @@ class MainActivity : ComponentActivity() {
                     onClick = {
                         onSave(serverUrl, deviceId, token)
                         onDismiss()
+                    }
+                ) {
+                    Text("保存")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+    
+    /**
+     * 唤醒词配置对话框
+     */
+    @Composable
+    private fun WakeWordConfigDialog(
+        currentKeywords: List<String>,
+        onDismiss: () -> Unit,
+        onSave: (List<String>) -> Unit
+    ) {
+        var keywords by remember { mutableStateOf(currentKeywords) }
+        
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("唤醒词配置") },
+            text = {
+                Column {
+                    Text(
+                        "格式：拼音音素 @显示名称\n例如：n ǐ h ǎo x iǎo zh ì @你好小智",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(bottom = 12.dp)
+                    )
+                    
+                    keywords.forEachIndexed { index, keyword ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedTextField(
+                                value = keyword,
+                                onValueChange = { newText ->
+                                    keywords = keywords.toMutableList().also {
+                                        it[index] = newText
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true
+                            )
+                            IconButton(
+                                onClick = {
+                                    keywords = keywords.toMutableList().also {
+                                        it.removeAt(index)
+                                    }
+                                }
+                            ) {
+                                Text("×", color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                    }
+                    
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    OutlinedButton(
+                        onClick = {
+                            keywords = keywords + ""
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("+ 添加唤醒词")
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onSave(keywords.filter { it.isNotBlank() })
                     }
                 ) {
                     Text("保存")

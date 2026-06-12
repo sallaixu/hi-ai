@@ -85,7 +85,7 @@ class WakeWordDetector(
                 ),
                 keywordsFile = keywordsPath,
                 keywordsScore = 1.5f,
-                keywordsThreshold = 0.25f,
+                keywordsThreshold = 0.15f,
                 numTrailingBlanks = 2
             )
             
@@ -144,7 +144,7 @@ class WakeWordDetector(
                 return
             }
             Log.d(TAG, "  - AudioRecord initialized")
-            
+
             // 创建检测流
             stream = spotter!!.createStream()
             Log.d(TAG, "  - Detection stream created")
@@ -218,7 +218,7 @@ class WakeWordDetector(
         } catch (e: Exception) {
             Log.e(TAG, "  - Error stopping AudioRecord", e)
         }
-        
+
         audioRecord?.release()
         audioRecord = null
         Log.d(TAG, "  - AudioRecord released")
@@ -233,8 +233,13 @@ class WakeWordDetector(
      * 更新关键词列表
      * 
      * 注意：这需要重新创建 KeywordSpotter
+     * 安全策略：先创建新的，成功后再释放旧的，避免创建失败时无可用 spotter
      */
     fun updateKeywords(keywords: List<String>): Boolean {
+        var oldSpotter: KeywordSpotter? = null
+        var oldStream: com.k2fsa.sherpa.onnx.OnlineStream? = null
+        var wasRunning = false
+        
         try {
             // 生成关键词文件内容
             val content = keywords.joinToString("\n")
@@ -244,18 +249,18 @@ class WakeWordDetector(
             keywordsFile.writeText(content)
             
             // 停止当前检测
-            val wasRunning = isRunning
+            wasRunning = isRunning
             if (wasRunning) {
                 stop()
             }
             
-            // 释放旧的 spotter
-            stream?.release()
-            stream = null
-            spotter?.release()
+            // 保存旧的 spotter 引用，先不释放
+            oldSpotter = spotter
+            oldStream = stream
             spotter = null
+            stream = null
             
-            // 重新初始化
+            // 尝试创建新的 spotter
             val modelPath = File(context.filesDir, MODEL_DIR).absolutePath
             val config = KeywordSpotterConfig(
                 featConfig = com.k2fsa.sherpa.onnx.FeatureConfig(
@@ -276,7 +281,12 @@ class WakeWordDetector(
                 numTrailingBlanks = 2
             )
             
-            spotter = KeywordSpotter(config = config)
+            val newSpotter = KeywordSpotter(config = config)
+            
+            // 新 spotter 创建成功，释放旧的
+            spotter = newSpotter
+            oldStream?.release()
+            oldSpotter?.release()
             
             // 如果之前在运行，重新启动
             if (wasRunning) {
@@ -287,6 +297,18 @@ class WakeWordDetector(
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to update keywords", e)
+            // 创建失败，恢复旧的 spotter
+            if (spotter == null && oldSpotter != null) {
+                spotter = oldSpotter
+                stream = oldStream
+                if (wasRunning) {
+                    start()
+                }
+                Log.w(TAG, "Restored old spotter after failed update")
+            } else if (oldSpotter != null) {
+                oldStream?.release()
+                oldSpotter?.release()
+            }
             return false
         }
     }

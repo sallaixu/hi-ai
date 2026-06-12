@@ -64,11 +64,14 @@ class NetworkManager(
     private val json = Json {
         ignoreUnknownKeys = true
         classDiscriminator = "type"
+        encodeDefaults = true
     }
     
     private var webSocket: WebSocket? = null
-    // 使用 replay = 1 缓存最后一个消息，避免 collect 启动延迟导致消息丢失
-    private val _messageFlow = MutableSharedFlow<Any>(replay = 1)
+    // 使用 replay = 1 + extraBufferCapacity = 64 确保消息不丢失
+    // replay = 1 缓存最后一个消息，避免 collect 启动延迟导致消息丢失
+    // extraBufferCapacity = 64 提供足够的缓冲空间处理消息爆发
+    private val _messageFlow = MutableSharedFlow<Any>(replay = 1, extraBufferCapacity = 64)
     val messageFlow: SharedFlow<Any> = _messageFlow.asSharedFlow()
     
     private var isConnected = false
@@ -191,6 +194,18 @@ class NetworkManager(
         Log.d(TAG, "  - WebSocket URL: $url")
         Log.d(TAG, "  - Token: ${if (token.isEmpty()) "(empty)" else "***"}")
         
+        // 确保全局唯一：如果已有连接，直接复用
+        if (isConnected && webSocket != null) {
+            Log.w(TAG, "  - Connection already exists, reusing existing connection")
+            return
+        }
+        
+        // 如果之前有连接但已断开，清理旧资源
+        if (webSocket != null) {
+            Log.d(TAG, "  - Cleaning up disconnected connection")
+            webSocket = null
+        }
+        
         // 构建完整的 WebSocket URL，添加必要的查询参数
         val wsUrl = buildString {
             append(url.trimEnd('/'))
@@ -280,18 +295,20 @@ class NetworkManager(
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d(TAG, "  - WebSocket closing: code=$code, reason=$reason")
                 isConnected = false
+                _messageFlow.tryEmit("websocket_disconnected")
                 webSocket.close(1000, null)
             }
             
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d(TAG, "  - WebSocket closed: code=$code, reason=$reason")
                 isConnected = false
+                _messageFlow.tryEmit("websocket_disconnected")
             }
             
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.e(TAG, "  - WebSocket failure", t)
                 isConnected = false
-                // TODO: 错误处理
+                _messageFlow.tryEmit("websocket_disconnected")
             }
         }
         
@@ -338,6 +355,7 @@ class NetworkManager(
         try {
             val message = AbortRequest(reason = reason)
             val jsonStr = json.encodeToString(message)
+            Log.d(TAG, "Sending abort message: $jsonStr, webSocketOpen=${webSocket != null}, containsType=${jsonStr.contains("\"type\":\"abort\"")}")
             val sent = webSocket?.send(jsonStr)
             Log.d(TAG, "Sent abort message, reason: $reason, sent: $sent")
         } catch (e: Exception) {
